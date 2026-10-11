@@ -28,6 +28,7 @@ macOS（Apple Silicon）：
 ```bash
 curl -fsSL -O https://github.com/zhj-ldm/aggrsearch/releases/latest/download/aggrsearch-v0.5.0-macos-arm64.tar.gz
 tar xzf aggrsearch-v0.5.0-macos-arm64.tar.gz
+cd aggrsearch-v0.5.0-macos-arm64
 ./aggrsearch version
 ```
 
