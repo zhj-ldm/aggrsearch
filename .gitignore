@@ -1,0 +1,5 @@
+target/
+dist/
+*.dmg
+*.mp3
+.DS_Store
