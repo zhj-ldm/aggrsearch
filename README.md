@@ -1,29 +1,52 @@
-# aggrsearch
+<p align="center">
+  <img src="docs/readme-hero.png" alt="aggrsearch — 面向 LLM 与 Agent 的多引擎聚合搜索">
+</p>
 
-面向 AI 的**多聚合搜索服务**：一个 Rust 二进制，同时提供本地 HTTP 接口和命令行工具，专为 LLM / Agent 取数设计。
+<p align="center">
+  <a href="https://github.com/zhj-ldm/aggrsearch/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/zhj-ldm/aggrsearch?style=flat-square&color=41e1bd"></a>
+  <img alt="rust" src="https://img.shields.io/badge/Rust-2024-000000?style=flat-square&logo=rust">
+  <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square">
+  <img alt="local" src="https://img.shields.io/badge/server-127.0.0.1-41e1bd?style=flat-square">
+</p>
 
-核心能力两件事：**搜得到**（多引擎并发 + 语义重排）和**读得全**（正文抽取 + CDN/WAF 拦截识别）。
+<p align="center">
+  <b>一个为 LLM / Agent 设计的多引擎搜索与正文抽取服务。</b><br>
+  一个 Rust 二进制，同时提供本地 HTTP API 与 CLI。
+</p>
 
----
+> 核心目标只有两个：**搜得到**（多引擎并发 + 语义重排）和 **读得全**（正文抽取 + CDN/WAF 拦截识别）。<br>
+> 不需要 API Key，不依赖浏览器，不把搜索结果困在某个 SaaS 里。
 
-## 特性
+## 为什么会有 aggrsearch
 
-| 能力 | 说明 |
+Agent 的搜索工具通常只有两种选择：昂贵的官方搜索 API，或者直接爬搜索引擎 HTML、拿回一堆导航和广告。
+
+aggrsearch 走第三条路：
+
+- **多个引擎一起搜**，URL 去重后合并，不把结果押在一个来源上。
+- **用结构化规则重排**，标题权重高于摘要，再叠加引擎先验；不引入额外模型。
+- **把网页正文读出来**，剥离脚本、导航和模板，让 LLM 拿到可用的上下文。
+- **识别反爬状态**，把被 CDN/WAF 拦下的域名缓存起来，避免反复浪费时间。
+- **只在本机监听**，CLI 与 HTTP 走同一套核心逻辑。
+
+## 能力总览
+
+| 能力 | 实现 |
 | --- | --- |
-| 多引擎聚合 | `bing_intl` > `bing_cn` > `baidu` > `sogou` 并发抓取，URL 去重后合并（360 已排除） |
-| 语义重排 | 词法相关度（title 权重 3 / snippet 权重 1）+ 引擎偏置排序 |
-| CJK 优化 | 查询预处理删除中文字符两侧空格，避免必应分词器拆词 |
-| 反爬对抗 | 百度 `wappass`/安全验证、搜狗 `antispider` 检测，per-engine 指数退避（5s 起，封顶 120s） |
-| 首页握手 | 百度/搜狗先访问首页建立 Cookie 与 Referer，避免直接打搜索页被拦 |
-| 搜狗 TLS | 搜狗专用客户端强制 TLS 1.2，规避无头指纹识别 |
-| 正文抽取 | 剥离 `script`/`style`/标签，正文质量分 < 0.35 判定被墙 |
-| 拦截缓存 | 被 CDN/WAF 拦截的域名缓存 2 小时，不再重复消耗时间 |
-| 零硬编码评分 | 质量分完全由 DOM 结构/文本比例/句子数/文本量统计得出 |
-| 诊断日志 | 每引擎状态码、字节数、质量分、反爬命中全部写 **stderr**；结果走 **stdout**，可安全管道 |
+| 多引擎聚合 | `bing_intl` > `bing_cn` > `baidu` > `sogou` 并发抓取，URL 去重合并 |
+| 语义重排 | 词法相关度（标题权重 3 / 摘要权重 1）+ 引擎偏置 |
+| CJK 优化 | 删除中文字符两侧空格，避免中文查询被分词器拆碎 |
+| 反爬对抗 | 百度 `wappass`、搜狗 `antispider` 检测；每引擎指数退避 5s → 120s |
+| 首页握手 | 百度 / 搜狗先访问首页建立 Cookie 与 Referer |
+| TLS 适配 | 搜狗专用客户端强制定向 TLS 1.2 |
+| 正文抽取 | 移除 `script` / `style` / 标签，按文本结构计算质量分 |
+| 拦截缓存 | 被 WAF 拦截的域名缓存 2 小时，避免重复消耗 |
+| 双入口 | HTTP 服务 + CLI，JSON 输出管道友好 |
+| 可观测 | 每引擎状态码 / 字节数 / 质量分 / 退避全部写 stderr |
 
-## 安装
+## 快速开始
 
-macOS（Apple Silicon）：
+### macOS 发布包
 
 ```bash
 curl -fsSL -O https://github.com/zhj-ldm/aggrsearch/releases/latest/download/aggrsearch-v0.5.0-macos-arm64.tar.gz
@@ -32,7 +55,7 @@ cd aggrsearch-v0.5.0-macos-arm64
 ./aggrsearch version
 ```
 
-从源码构建：
+### 从源码构建
 
 ```bash
 git clone https://github.com/zhj-ldm/aggrsearch.git
@@ -41,63 +64,63 @@ cargo build --release
 ./target/release/aggrsearch version
 ```
 
-## 命令行用法
+Rust 版本要求：`1.85+`（edition 2024）。
+
+## 两种使用方式
+
+### 1. 本地 HTTP 服务
 
 ```bash
-# 启动本地 HTTP 服务（默认 127.0.0.1:8080）
+# 默认监听 127.0.0.1:8080
 aggrsearch serve
 aggrsearch serve --port 9090
+```
 
-# 直接搜索
+```bash
+curl 'http://127.0.0.1:8080/search?q=Rust+axum&max_results=3'
+curl 'http://127.0.0.1:8080/fetch?url=https://example.com/article'
+curl 'http://127.0.0.1:8080/health'
+```
+
+### 2. 命令行直接使用
+
+```bash
 aggrsearch search "Rust axum 教程"
 aggrsearch search "英伟达财报" --max 5 --topic news --freshness w
 aggrsearch search "site docs" --include docs.rs,github.com --exclude medium.com
 aggrsearch search "缓存策略" --engines bing_intl,baidu --json
 
-# 抓取网页正文
 aggrsearch fetch https://example.com/article
 aggrsearch fetch https://example.com/article --json
-
-# 健康检查 / 版本
-aggrsearch health
-aggrsearch version
 ```
 
-### search 选项
-
-| 选项 | 说明 |
-| --- | --- |
-| `--max <n>` | 返回条数，1-20，默认 10 |
-| `--freshness <d\|w\|m\|y>` | 时间范围，仅作用于必应 `&tbs=qdr:` |
-| `--topic <news>` | `news` 走必应新闻垂直 |
-| `--include <a,b>` | 仅保留指定域名（含子域匹配） |
-| `--exclude <a,b>` | 排除指定域名 |
-| `--engines <a,b>` | 限定引擎：`bing_intl,bing_cn,baidu,sogou` |
-| `--json` | 输出原始 JSON，便于管道交给 LLM |
-
-> 管道友好：`aggrsearch search "关键词" --json | jq -r '.results[].url'`
-
-## HTTP 接口
-
-启动 `aggrsearch serve` 后监听 `127.0.0.1:8080`（可用 `PORT` 环境变量或 `--port` 修改）。
-
-### `GET /search`
-
-| 参数 | 取值 |
-| --- | --- |
-| `q` | 查询词（必填） |
-| `max_results` | 1-20，默认 10 |
-| `freshness` | `d` \| `w` \| `m` \| `y` |
-| `topic` | `general` \| `news` |
-| `include_domains` | 逗号分隔 |
-| `exclude_domains` | 逗号分隔 |
-| `engines` | 逗号分隔的引擎名 |
+管道交给 LLM：
 
 ```bash
-curl 'http://127.0.0.1:8080/search?q=Rust+axum&max_results=3'
+aggrsearch search "向量数据库选型" --json | jq -r '.results[].url'
 ```
 
-响应结构：
+## CLI 参数
+
+### `search`
+
+| 参数 | 说明 |
+| --- | --- |
+| `--max <n>` | 返回条数，1–20，默认 10 |
+| `--freshness <d\|w\|m\|y>` | 时间范围，作用于必应 `&tbs=qdr:` |
+| `--topic <news>` | `news` 走必应新闻垂直 |
+| `--include <a,b>` | 仅保留指定域名（含子域） |
+| `--exclude <a,b>` | 排除指定域名 |
+| `--engines <a,b>` | 限定引擎：`bing_intl,bing_cn,baidu,sogou` |
+| `--json` | 输出原始 JSON，便于管道处理 |
+
+### `fetch`
+
+抓取网页并抽取正文。被 CDN/WAF 拦截时，返回 `error`，`body` 为空，并把域名加入 2 小时拦截缓存。
+
+## HTTP 响应
+
+`GET /search` 的典型响应：
 
 ```json
 {
@@ -121,30 +144,48 @@ curl 'http://127.0.0.1:8080/search?q=Rust+axum&max_results=3'
 }
 ```
 
-### `GET /fetch`
+`GET /fetch` 返回 `status`、`content_type`、`body`（纯正文）、`error` 与 `_timing.total`。
 
-```bash
-curl 'http://127.0.0.1:8080/fetch?url=https://example.com/article'
+## 工作方式
+
+```text
+                    ┌──────────────┐
+                    │  query + opts │
+                    └──────┬───────┘
+                           │
+         ┌─────────────────┼─────────────────┐
+         ▼                 ▼                 ▼
+   bing_intl           bing_cn            baidu / sogou
+         │                 │                 │
+         └─────────────────┼─────────────────┘
+                           ▼
+                  URL 去重 / 过滤 / 清洗
+                           ▼
+                  相关度 + 引擎偏置重排
+                           ▼
+                       JSON / Text
 ```
 
-响应包含 `status`、`content_type`、`body`（纯正文）、`error` 与 `_timing.total`。
-被 CDN/WAF 拦截时返回 `error` 且 `body` 为空，并把该域名加入 2 小时拦截缓存。
+`fetch` 路径：
 
-### `GET /health`
-
-```json
-{ "status": "ok", "name": "aggrsearch", "version": "0.5.0" }
+```text
+URL → HTTP 抓取 → 拦截识别 → 剥离 script/style → 正文质量分 → 纯文本 / JSON
 ```
 
-## 日志
+### 设计取舍
 
-诊断日志走 stderr，结果走 stdout，因此可以直接重定向分离：
+- **不调用搜索 API**：免 Key、免账号，代价是依赖引擎 HTML 结构，需要持续维护。
+- **不引入向量模型**：重排完全可解释，启动没有额外模型加载和显存占用。
+- **质量分不是魔法**：由 DOM 结构、文本比例、句子数、文本量统计得出，阈值调参可复现。
+- **先保结果，再报错误**：单引擎失败不影响整体；只有全部引擎失败才返回错误。
+
+## 可观测性
+
+诊断日志写 **stderr**，结果写 **stdout**，不会污染 JSON 管道：
 
 ```bash
 aggrsearch search "关键词" --json 2> search.log | jq .
 ```
-
-典型日志：
 
 ```text
 [bing_intl] status=200 bytes=48213 quality=0.61
@@ -153,22 +194,28 @@ aggrsearch search "关键词" --json 2> search.log | jq .
 [sogou] 进入退避 5s
 ```
 
-## 作为 LLM 工具接入
+## 作为 LLM / Agent 工具
 
-服务默认只绑定回环地址，不对外暴露。Claude / Cursor / 自建 Agent 的典型接法：
-
-1. 用 `aggrsearch fetch <url> --json` 作为取原文的手段（LLM 上下文更省）；
-2. 或让 Agent 把 `http://127.0.0.1:8080/search` 当作 HTTP 工具调用。
+- 把 `http://127.0.0.1:8080/search` 注册为 HTTP 工具。
+- 或者用 `aggrsearch fetch <url> --json` 单独获取原文，减少上下文里的导航噪声。
+- 默认只绑定回环地址，不会暴露到局域网。
 
 ## 开发
 
 ```bash
 cargo fmt
 cargo test        # 纯函数单测，不触网
-cargo build --release
 cargo clippy
+cargo build --release
 ```
 
-## 许可证
+## 已知边界
 
-Apache-2.0，见 [LICENSE](LICENSE)。
+- 搜索引擎页面结构变化会导致解析失效，需要更新选择器。
+- 抓取频率过高会触发验证码或临时封禁；请控制请求频率并遵守目标站点条款。
+- 本项目不绕过登录、付费墙或验证码，只做公开页面的读取。
+- 适合个人 Agent、内部工具和检索实验，不建议直接作为面向公网的高并发搜索后端。
+
+## License
+
+[Apache License 2.0](LICENSE)
