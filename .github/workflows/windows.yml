@@ -1,0 +1,114 @@
+name: Windows Build & Smoke Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: aggrsearch.exe
+
+jobs:
+  build:
+    name: Build (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Unit tests
+        run: cargo test --release --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target\release\$env:BIN" "dist\$env:BIN"
+          Compress-Archive -Path "dist\$env:BIN" -DestinationPath "dist\aggrsearch-windows-x86_64.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aggrsearch-windows-x86_64
+          path: |
+            dist/aggrsearch-windows-x86_64.zip
+            dist/aggrsearch.exe
+          if-no-files-found: error
+
+  smoke-test:
+    name: Smoke test (run on Windows)
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: aggrsearch-windows-x86_64
+          path: dist
+
+      - name: version / health CLI
+        shell: pwsh
+        run: |
+          $exe = "dist\aggrsearch.exe"
+          & $exe version
+          if ($LASTEXITCODE -ne 0) { throw "version 退出码 $LASTEXITCODE" }
+          & $exe health | Tee-Object -Variable healthOut
+          if ($LASTEXITCODE -ne 0) { throw "health 退出码 $LASTEXITCODE" }
+          $healthOut | Out-String | Write-Host
+          $json = (& $exe health | Out-String) | ConvertFrom-Json
+          if ($json.status -ne "ok") { throw "health 状态异常: $($json.status)" }
+          if ($json.name -ne "aggrsearch") { throw "health name 异常: $($json.name)" }
+
+      - name: HTTP server /health
+        shell: pwsh
+        run: |
+          $exe = "dist\aggrsearch.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "serve","--port","18080" -PassThru -NoNewWindow
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              try {
+                $r = Invoke-RestMethod -Uri "http://127.0.0.1:18080/health" -TimeoutSec 3
+                if ($r.status -eq "ok") { $ok = $true; break }
+              } catch { }
+            }
+            if (-not $ok) { throw "服务 30s 内未就绪" }
+            Write-Host "GET /health -> $($r | ConvertTo-Json -Compress)"
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          }
+
+      - name: Online search & fetch (best effort)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = "dist\aggrsearch.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "serve","--port","18081" -PassThru -NoNewWindow
+          try {
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              try { Invoke-RestMethod -Uri "http://127.0.0.1:18081/health" -TimeoutSec 3 | Out-Null; break } catch { }
+            }
+            Write-Host "--- /search ---"
+            $s = Invoke-RestMethod -Uri "http://127.0.0.1:18081/search?q=rust&max_results=3" -TimeoutSec 30
+            $s | ConvertTo-Json -Depth 4 | Write-Host
+            Write-Host "results=$($s.results.Count)"
+            Write-Host "--- /fetch ---"
+            $f = Invoke-RestMethod -Uri "http://127.0.0.1:18081/fetch?url=https://www.rust-lang.org/" -TimeoutSec 30
+            Write-Host "status=$($f.status) body_len=$($f.body.Length)"
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          }
