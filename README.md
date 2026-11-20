@@ -68,7 +68,7 @@ Rust 版本要求：`1.85+`（edition 2024）。
 
 ### Embedding 重排
 
-默认使用 `EmbeddingGemma-300M`（ONNX int8，约 309MB），首次搜索时自动下载并缓存，之后完全本地推理。Windows 版需把 `onnxruntime.dll` 与 `aggrsearch.exe` 放在同一目录（发布包已自带）。
+默认使用 `EmbeddingGemma-300M`（ONNX int8，约 309MB），首次搜索时自动下载并缓存，之后完全本地推理。ONNX Runtime 已静态链接进单文件 exe，Windows 版无需额外 DLL。
 
 | 环境变量 | 说明 |
 | --- | --- |

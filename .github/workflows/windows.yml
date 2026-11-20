@@ -36,7 +36,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "target\release\$env:BIN" "dist\$env:BIN"
-          # ONNX Runtime 在 Windows 上是动态库，必须与 exe 一起分发
+          # 当前 ort 在 Windows 上静态链接；若未来输出动态库则一并打包
           Get-ChildItem "target\release\*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
             Copy-Item $_.FullName "dist\$($_.Name)"
             Write-Host "bundled $($_.Name)"
