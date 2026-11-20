@@ -1379,7 +1379,8 @@ async fn cmd_search(args: &[String]) -> i32 {
         exclude_domains: o.exclude,
         engines: o.engines,
     };
-    embedding::warmup();
+    // 模型加载会做同步 HTTP 下载，放到阻塞线程里避免阻塞 tokio
+    let _ = tokio::task::spawn_blocking(embedding::warmup).await;
     let Json(value) = handle_search(Query(params)).await;
     if let Some(err) = value.get("error").and_then(|v| v.as_str()) {
         eprintln!("搜索失败: {err}");

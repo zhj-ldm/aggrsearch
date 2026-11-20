@@ -13,11 +13,21 @@ const GEMMA_QUERY_PREFIX: &str = "task: search result | query: ";
 const GEMMA_DOC_PREFIX: &str = "title: ";
 const GEMMA_DOC_SEP: &str = " | text: ";
 
+/// 模型仓库里的通用 tokenizer / config 文件
+const TOKENIZER_FILES: &[&str] = &[
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+];
+
 struct ModelSpec {
     model: EmbeddingModel,
     name: &'static str,
     prompt: bool,
     max_length: usize,
+    repo: &'static str,
+    model_files: &'static [&'static str],
 }
 
 struct Loaded {
@@ -50,6 +60,11 @@ fn model_spec() -> Result<ModelSpec, String> {
                 name: "embeddinggemma-300m-int8",
                 prompt: true,
                 max_length: 512,
+                repo: "onnx-community/embeddinggemma-300m-ONNX",
+                model_files: &[
+                    "onnx/model_quantized.onnx",
+                    "onnx/model_quantized.onnx_data",
+                ],
             })
         }
         "gemma-q4" | "embeddinggemma-300m-q4" | "embeddinggemma300mq4" => Ok(ModelSpec {
@@ -57,6 +72,8 @@ fn model_spec() -> Result<ModelSpec, String> {
             name: "embeddinggemma-300m-q4",
             prompt: true,
             max_length: 512,
+            repo: "onnx-community/embeddinggemma-300m-ONNX",
+            model_files: &["onnx/model_q4.onnx", "onnx/model_q4.onnx_data"],
         }),
         // 仅用于测试/CI：体积很小，验证 embedding 链路
         "minilm" | "all-minilm-l6-v2" | "allminilml6v2" => Ok(ModelSpec {
@@ -64,6 +81,8 @@ fn model_spec() -> Result<ModelSpec, String> {
             name: "all-minilm-l6-v2-q",
             prompt: false,
             max_length: 512,
+            repo: "Xenova/all-MiniLM-L6-v2",
+            model_files: &["onnx/model_quantized.onnx"],
         }),
         other => Err(format!(
             "未知 AGGRSEARCH_EMBED_MODEL: {other}（可选: gemma、gemma-q4、minilm）"
@@ -116,11 +135,154 @@ fn intra_threads() -> Option<usize> {
         .filter(|n| *n > 0)
 }
 
+fn hf_endpoint() -> String {
+    std::env::var("HF_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://huggingface.co".to_string())
+}
+
+fn model_files(spec: &ModelSpec) -> Vec<&'static str> {
+    spec.model_files
+        .iter()
+        .chain(TOKENIZER_FILES.iter())
+        .copied()
+        .collect()
+}
+
+fn repo_cache_dir(root: &std::path::Path, repo: &str) -> PathBuf {
+    root.join(format!("models--{}", repo.replace('/', "--")))
+}
+
+fn http_client() -> Result<reqwest::blocking::Client, String> {
+    use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    if let Ok(token) = std::env::var("HF_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            let value = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|e| format!("HF_TOKEN 非法: {e}"))?;
+            headers.insert(AUTHORIZATION, value);
+        }
+    }
+    reqwest::blocking::Client::builder()
+        .user_agent(concat!("aggrsearch/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(1800))
+        .default_headers(headers)
+        .build()
+        .map_err(|e| format!("创建下载客户端失败: {e}"))
+}
+
+/// 用普通 GET（不带 Range）补齐 hf-hub 的缓存目录。
+/// 国内镜像（hf-mirror）不支持 Range，hf-hub 会因缺少 Content-Range 报错，
+/// 因此这里先自行下载，之后 fastembed 直接读本地缓存即可。
+fn ensure_cache(spec: &ModelSpec) -> Result<PathBuf, String> {
+    let root = cache_dir();
+    let repo_dir = repo_cache_dir(&root, spec.repo);
+    let ref_file = repo_dir.join("refs").join("main");
+    let files = model_files(spec);
+
+    let ready = |revision: &str| {
+        files.iter().all(|file| {
+            repo_dir
+                .join("snapshots")
+                .join(revision)
+                .join(file)
+                .metadata()
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        })
+    };
+
+    let mut revision = std::fs::read_to_string(&ref_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(rev) = &revision {
+        if ready(rev) {
+            return Ok(root);
+        }
+    }
+
+    let client = http_client()?;
+    let endpoint = hf_endpoint();
+
+    if revision.is_none() || !ready(revision.as_deref().unwrap_or_default()) {
+        let url = format!("{endpoint}/api/models/{}", spec.repo);
+        let resolved = client
+            .get(&url)
+            .send()
+            .ok()
+            .filter(|r| r.status().is_success())
+            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .and_then(|v| v.get("sha").and_then(|s| s.as_str()).map(str::to_string));
+        revision = Some(resolved.unwrap_or_else(|| "main".to_string()));
+    }
+    let revision = revision.unwrap_or_else(|| "main".to_string());
+    let snapshot = repo_dir.join("snapshots").join(&revision);
+
+    std::fs::create_dir_all(&snapshot)
+        .and_then(|_| std::fs::create_dir_all(repo_dir.join("refs")))
+        .map_err(|e| format!("创建模型缓存目录失败: {e}"))?;
+
+    for file in &files {
+        let target = snapshot.join(file);
+        if target.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            continue;
+        }
+        download_file(&client, &endpoint, spec.repo, &revision, file, &target)?;
+    }
+
+    std::fs::write(&ref_file, format!("{revision}\n"))
+        .map_err(|e| format!("写入模型版本标记失败: {e}"))?;
+    Ok(root)
+}
+
+fn download_file(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    repo: &str,
+    revision: &str,
+    file: &str,
+    target: &std::path::Path,
+) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+    let url = format!("{endpoint}/{repo}/resolve/{revision}/{file}");
+    eprintln!("[embedding] 下载 {file} ...");
+
+    let mut response = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("下载 {file} 失败: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("下载 {file} 失败: {e}"))?;
+
+    let tmp = target.with_extension("part");
+    let mut out = std::fs::File::create(&tmp)
+        .map_err(|e| format!("创建临时文件 {} 失败: {e}", tmp.display()))?;
+    std::io::copy(&mut response, &mut out).map_err(|e| format!("写入 {file} 失败: {e}"))?;
+    out.sync_all().ok();
+    drop(out);
+    std::fs::rename(&tmp, target).map_err(|e| format!("重命名模型文件失败: {e}"))?;
+
+    let size = target.metadata().map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "[embedding] 已缓存 {file} ({:.1} MB)",
+        size as f64 / 1_000_000.0
+    );
+    Ok(())
+}
+
 fn load() -> Result<&'static Loaded, String> {
     let result = LOADED.get_or_init(|| {
         let spec = model_spec()?;
+        let cache = ensure_cache(&spec)?;
         let mut options = TextInitOptions::new(spec.model)
-            .with_cache_dir(cache_dir())
+            .with_cache_dir(cache)
             .with_show_download_progress(true)
             .with_max_length(spec.max_length);
         if let Some(threads) = intra_threads() {
