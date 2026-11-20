@@ -36,7 +36,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "target\release\$env:BIN" "dist\$env:BIN"
-          Compress-Archive -Path "dist\$env:BIN" -DestinationPath "dist\aggrsearch-windows-x86_64.zip" -Force
+          # ONNX Runtime 在 Windows 上是动态库，必须与 exe 一起分发
+          Get-ChildItem "target\release\*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName "dist\$($_.Name)"
+            Write-Host "bundled $($_.Name)"
+          }
+          Compress-Archive -Path "dist\*" -DestinationPath "dist\aggrsearch-windows-x86_64.zip" -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -45,12 +50,16 @@ jobs:
           path: |
             dist/aggrsearch-windows-x86_64.zip
             dist/aggrsearch.exe
+            dist/*.dll
           if-no-files-found: error
 
   smoke-test:
     name: Smoke test (run on Windows)
     needs: build
     runs-on: windows-latest
+    env:
+      # 常规冒烟测试不下载模型，只验证 CLI/HTTP 与词法回退
+      AGGRSEARCH_EMBED: "off"
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -109,6 +118,57 @@ jobs:
             Write-Host "--- /fetch ---"
             $f = Invoke-RestMethod -Uri "http://127.0.0.1:18081/fetch?url=https://www.rust-lang.org/" -TimeoutSec 30
             Write-Host "status=$($f.status) body_len=$($f.body.Length)"
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          }
+
+  embedding-test:
+    name: Embedding rerank (run on Windows)
+    needs: build
+    runs-on: windows-latest
+    env:
+      AGGRSEARCH_EMBED_CACHE: ${{ github.workspace }}/.embed-cache
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: aggrsearch-windows-x86_64
+          path: dist
+
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.embed-cache
+          key: embeddinggemma-300m-int8-v1
+
+      - name: Run embedding rerank over HTTP
+        shell: pwsh
+        run: |
+          $exe = "dist\aggrsearch.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "serve","--port","18083" -PassThru -NoNewWindow
+          try {
+            Write-Host "等待 embedding 模型加载（首次需下载约 309MB）..."
+            $ready = $false
+            for ($i = 0; $i -lt 180; $i++) {
+              Start-Sleep -Seconds 5
+              try {
+                $h = Invoke-RestMethod -Uri "http://127.0.0.1:18083/health" -TimeoutSec 5
+                if ($h.embedding.ready) { $ready = $true; break }
+              } catch { }
+              if ($p.HasExited) { throw "服务提前退出，退出码 $($p.ExitCode)" }
+            }
+            if (-not $ready) { throw "embedding 模型 15 分钟内未就绪" }
+            Write-Host "embedding ready: $($h.embedding | ConvertTo-Json -Compress)"
+
+            $s = Invoke-RestMethod -Uri "http://127.0.0.1:18083/search?q=rust%20async&max_results=3&engines=bing_intl" -TimeoutSec 90
+            $s | ConvertTo-Json -Depth 5 | Write-Host
+            if ($s._timing.stages.embedding_rerank -ne $true) { throw "本次搜索未走 embedding 重排" }
+            if (-not $s.results -or $s.results.Count -eq 0) { throw "搜索无结果，无法验证重排分数" }
+            foreach ($r in $s.results) {
+              $score = [double]$r._rerank_score
+              if ($score -lt -1.0 -or $score -gt 1.0) { throw "非法的余弦分数: $score" }
+              Write-Host ("{0}  score={1:N4}" -f $r.title, $score)
+            }
           } finally {
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
           }

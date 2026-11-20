@@ -34,7 +34,7 @@ aggrsearch 走第三条路：
 | 能力 | 实现 |
 | --- | --- |
 | 多引擎聚合 | `bing_intl` > `bing_cn` > `baidu` > `sogou` 并发抓取，URL 去重合并 |
-| 语义重排 | 词法相关度（标题权重 3 / 摘要权重 1）+ 引擎偏置 |
+| 语义重排 | 本地 EmbeddingGemma-300M 余弦相似度（对齐 SearchPIN），模型不可用时回退词法相关度 |
 | CJK 优化 | 删除中文字符两侧空格，避免中文查询被分词器拆碎 |
 | 反爬对抗 | 百度 `wappass`、搜狗 `antispider` 检测；每引擎指数退避 5s → 120s |
 | 首页握手 | 百度 / 搜狗先访问首页建立 Cookie 与 Referer |
@@ -65,6 +65,18 @@ cargo build --release
 ```
 
 Rust 版本要求：`1.85+`（edition 2024）。
+
+### Embedding 重排
+
+默认使用 `EmbeddingGemma-300M`（ONNX int8，约 309MB），首次搜索时自动下载并缓存，之后完全本地推理。Windows 版需把 `onnxruntime.dll` 与 `aggrsearch.exe` 放在同一目录（发布包已自带）。
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `AGGRSEARCH_EMBED=off` | 关闭 embedding，仅用词法重排 |
+| `AGGRSEARCH_EMBED_MODEL` | `gemma`（默认）/ `gemma-q4`（更小更快）/ `minilm`（测试用） |
+| `AGGRSEARCH_EMBED_CACHE` | 模型缓存目录（默认 Windows `%LOCALAPPDATA%\aggrsearch\models`，macOS `~/Library/Caches/aggrsearch/models`） |
+| `AGGRSEARCH_EMBED_THREADS` | ONNX Runtime 推理线程数，默认用满所有核心 |
+| `HF_ENDPOINT` | Hugging Face 镜像，例如 `https://hf-mirror.com` |
 
 ## 两种使用方式
 

@@ -22,6 +22,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
+mod embedding;
+
 // ---------------- 数据结构（对齐 SearchPIN 返回）----------------
 
 #[derive(Debug, Clone, Serialize)]
@@ -854,6 +856,53 @@ async fn fetch_candidates(ctx: &QueryCtx, engines: &[String]) -> Vec<SearchResul
     all
 }
 
+/// 用本地 embedding 余弦相似度重排（对齐 SearchPIN）；失败返回 false 交给词法重排
+async fn apply_embedding_rerank(
+    query: &str,
+    results: &mut Vec<SearchResult>,
+    max_results: usize,
+) -> bool {
+    if !embedding::enabled() || results.is_empty() {
+        return false;
+    }
+
+    let docs: Vec<(String, String)> = results
+        .iter()
+        .map(|r| (r.title.clone(), r.snippet.clone()))
+        .collect();
+    let q = query.to_string();
+    let joined = tokio::task::spawn_blocking(move || embedding::score(&q, &docs)).await;
+
+    let scores = match joined {
+        Ok(Ok(scores)) => scores,
+        Ok(Err(e)) => {
+            eprintln!("[embedding] 重排失败，回退词法: {e}");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("[embedding] 重排任务失败，回退词法: {e}");
+            return false;
+        }
+    };
+
+    if scores.len() != results.len() {
+        eprintln!(
+            "[embedding] 分数数量不匹配 ({} != {})，回退词法",
+            scores.len(),
+            results.len()
+        );
+        return false;
+    }
+
+    for (result, score) in results.iter_mut().zip(scores) {
+        result.rerank_score = score;
+    }
+    results.sort_by(|a, b| b.rerank_score.total_cmp(&a.rerank_score));
+    results.truncate(max_results);
+    eprintln!("[embedding] reranked {} results", results.len());
+    true
+}
+
 // ---------------- 服务：/search ----------------
 
 #[derive(Debug, serde::Deserialize)]
@@ -919,7 +968,10 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<serde_json::V
     filter_domains(&mut all, &include, &exclude);
 
     let t_rerank_start = Instant::now();
-    rerank(&query, &mut all, max_results);
+    let embedding_used = apply_embedding_rerank(&query, &mut all, max_results).await;
+    if !embedding_used {
+        rerank(&query, &mut all, max_results);
+    }
     let rerank_ms = t_rerank_start.elapsed().as_millis() as f64 / 1000.0;
 
     // engine 分布
@@ -952,6 +1004,7 @@ async fn handle_search(Query(params): Query<SearchParams>) -> Json<serde_json::V
                 "pages": 1,
                 "page_ms": [round2(search_ms * 1000.0)],
                 "num_results_merged": merged,
+                "embedding_rerank": embedding_used,
             },
             "engine_counts": engine_counts,
         }
@@ -1068,6 +1121,7 @@ fn health_payload() -> serde_json::Value {
         "status": "ok",
         "name": "aggrsearch",
         "version": VERSION,
+        "embedding": embedding::status(),
     })
 }
 
@@ -1096,6 +1150,15 @@ fn print_banner(port: u16) {
     println!("aggrsearch v{VERSION} 已启动: http://127.0.0.1:{port}");
     println!("  引擎: bing_intl > bing_cn > baidu > sogou (360 已排除)");
     println!("  能力: web_search + web_fetch");
+    if embedding::enabled() {
+        let model = embedding::status()["model"]
+            .as_str()
+            .unwrap_or("embedding")
+            .to_string();
+        println!("  重排: embedding ({model})");
+    } else {
+        println!("  重排: 词法（embedding 已通过 AGGRSEARCH_EMBED 关闭）");
+    }
     println!(
         "  GET /search?q=&max_results=&freshness=d|w|m|y&topic=general|news&include_domains=&exclude_domains="
     );
@@ -1112,6 +1175,7 @@ async fn serve(port: u16) {
             std::process::exit(1);
         });
     print_banner(port);
+    tokio::task::spawn_blocking(embedding::warmup);
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("服务异常退出: {e}");
         std::process::exit(1);
@@ -1315,6 +1379,7 @@ async fn cmd_search(args: &[String]) -> i32 {
         exclude_domains: o.exclude,
         engines: o.engines,
     };
+    embedding::warmup();
     let Json(value) = handle_search(Query(params)).await;
     if let Some(err) = value.get("error").and_then(|v| v.as_str()) {
         eprintln!("搜索失败: {err}");
