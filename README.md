@@ -24,7 +24,7 @@ Agent 的搜索工具通常只有两种选择：昂贵的官方搜索 API，或�
 aggrsearch 走第三条路：
 
 - **多个引擎一起搜**，URL 去重后合并，不把结果押在一个来源上。
-- **用结构化规则重排**，标题权重高于摘要，再叠加引擎先验；不引入额外模型。
+- **可选语义重排**：本地 EmbeddingGemma 向量相似度排序；默认不下载模型，缺模型时自动回退轻量词法重排。
 - **把网页正文读出来**，剥离脚本、导航和模板，让 LLM 拿到可用的上下文。
 - **识别反爬状态**，把被 CDN/WAF 拦下的域名缓存起来，避免反复浪费时间。
 - **只在本机监听**，CLI 与 HTTP 走同一套核心逻辑。
@@ -66,13 +66,28 @@ cargo build --release
 
 Rust 版本要求：`1.85+`（edition 2024）。
 
-### Embedding 重排
+### Embedding 重排（可选，默认离线）
 
-默认使用 `EmbeddingGemma-300M`（ONNX int8，约 309MB），首次搜索时自动下载并缓存，之后完全本地推理。ONNX Runtime 已静态链接进单文件 exe，Windows 版无需额外 DLL。
+向量重排使用 `EmbeddingGemma-300M`（ONNX int8，约 292MB），**默认不下载**：
+
+- `auto`（默认）：本地已有完整模型就启用向量重排，没有就直接用词法重排，绝不联网；
+- `on`：期望使用向量重排，模型缺失时只报错提示，不自动下载；
+- `off`：强制词法重排。
+
+需要向量重排时显式安装（唯一的联网入口）：
+
+```bash
+aggrsearch models status                       # 查看模式 / 模型 / 是否已安装
+aggrsearch models download                     # 默认 gemma（int8）
+aggrsearch models download --model gemma-q4    # 更小更快
+aggrsearch models remove                       # 删除模型，回到词法重排
+```
+
+ONNX Runtime 已静态链接进单文件 exe，Windows / macOS 均无需额外动态库。
 
 | 环境变量 | 说明 |
 | --- | --- |
-| `AGGRSEARCH_EMBED=off` | 关闭 embedding，仅用词法重排 |
+| `AGGRSEARCH_EMBED` | `auto`（默认）/ `on` / `off` |
 | `AGGRSEARCH_EMBED_MODEL` | `gemma`（默认）/ `gemma-q4`（更小更快）/ `minilm`（测试用） |
 | `AGGRSEARCH_EMBED_CACHE` | 模型缓存目录（默认 Windows `%LOCALAPPDATA%\aggrsearch\models`，macOS `~/Library/Caches/aggrsearch/models`） |
 | `AGGRSEARCH_EMBED_THREADS` | ONNX Runtime 推理线程数，默认用满所有核心 |

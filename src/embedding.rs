@@ -1,10 +1,15 @@
 //! 本地 embedding 重排（对齐 SearchPIN 的 `_embedding_rerank`）
 //!
-//! 默认模型：EmbeddingGemma-300M（ONNX int8，约 309MB），首次使用自动下载并缓存。
+//! 默认模型：EmbeddingGemma-300M（ONNX int8，约 309MB）。
+//! 采用三态策略，避免开源用户被动下载大模型：
+//! - `auto`（默认）：本地有完整模型才启用向量重排，没有就直接用词法，**绝不联网**；
+//! - `on`：期望使用向量重排，模型缺失时仅报错提示，不自动下载；
+//! - `off`：强制词法重排。
+//! 模型只能用 `aggrsearch models download` 显式安装。
 //! 文档表示与 SearchPIN 一致：`title + " " + snippet`，query 与文档一起 embed，
 //! 用余弦相似度作为 `_rerank_score`。模型不可用时由调用方回退到词法重排。
 
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -38,20 +43,56 @@ struct Loaded {
 
 static LOADED: OnceLock<Result<Loaded, String>> = OnceLock::new();
 
-/// embedding 重排是否启用（`AGGRSEARCH_EMBED=off|0|false|none` 可关闭）
+/// embedding 工作模式（`AGGRSEARCH_EMBED` 控制）
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// 强制关闭，只用词法重排
+    Off,
+    /// 期望使用向量重排；模型缺失时报告错误但不下载
+    On,
+    /// 本地有模型才用，否则词法；默认值，绝不联网
+    Auto,
+}
+
+/// 读取当前工作模式；未配置时为 `auto`
+pub fn mode() -> Mode {
+    match std::env::var("AGGRSEARCH_EMBED")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "0" | "false" | "none" | "no" => Mode::Off,
+        "on" | "1" | "true" | "yes" => Mode::On,
+        _ => Mode::Auto,
+    }
+}
+
+/// 当前模式名（用于日志 / 健康检查）
+pub fn mode_name() -> &'static str {
+    match mode() {
+        Mode::Off => "off",
+        Mode::On => "on",
+        Mode::Auto => "auto",
+    }
+}
+
+/// 本次调用是否应尝试向量重排。
+/// `auto` 只检查本地模型是否完整，不会触发下载；`on` 允许尝试加载（仍不下载）。
 pub fn enabled() -> bool {
-    !matches!(
-        std::env::var("AGGRSEARCH_EMBED")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "off" | "0" | "false" | "none" | "no"
-    )
+    match mode() {
+        Mode::Off => false,
+        Mode::On => true,
+        Mode::Auto => local_ready(),
+    }
 }
 
 fn model_spec() -> Result<ModelSpec, String> {
     let raw = std::env::var("AGGRSEARCH_EMBED_MODEL").unwrap_or_default();
+    model_spec_from(&raw)
+}
+
+fn model_spec_from(raw: &str) -> Result<ModelSpec, String> {
     let key = raw.trim().to_ascii_lowercase();
     match key.as_str() {
         "" | "gemma" | "gemma-int8" | "embeddinggemma-300m" | "embeddinggemma300m" => {
@@ -155,6 +196,76 @@ fn repo_cache_dir(root: &std::path::Path, repo: &str) -> PathBuf {
     root.join(format!("models--{}", repo.replace('/', "--")))
 }
 
+/// 大模型权重分段文件常有几百 MB，几 MB 的通常是下载被截断的残片
+fn file_ok(name: &str, len: u64) -> bool {
+    len > 0 && (!name.ends_with(".onnx_data") || len > 50_000_000)
+}
+
+fn files_ready(repo_dir: &std::path::Path, revision: &str, spec: &ModelSpec) -> bool {
+    model_files(spec).iter().all(|file| {
+        repo_dir
+            .join("snapshots")
+            .join(revision)
+            .join(file)
+            .metadata()
+            .map(|m| file_ok(file, m.len()))
+            .unwrap_or(false)
+    })
+}
+
+/// 本地模型是否完整可用；只读文件系统，绝不联网。
+pub fn local_ready() -> bool {
+    let Ok(spec) = model_spec() else {
+        return false;
+    };
+    let repo_dir = repo_cache_dir(&cache_dir(), spec.repo);
+    std::fs::read_to_string(repo_dir.join("refs").join("main"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|rev| files_ready(&repo_dir, &rev, &spec))
+        .unwrap_or(false)
+}
+
+fn spec_for(model: Option<&str>) -> Result<ModelSpec, String> {
+    match model.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(key) => model_spec_from(key),
+        None => model_spec(),
+    }
+}
+
+/// 显式下载模型（唯一的联网入口）。`model` 为空时使用 `AGGRSEARCH_EMBED_MODEL` 或默认值。
+pub fn download(model: Option<&str>) -> Result<PathBuf, String> {
+    let spec = spec_for(model)?;
+    ensure_cache(&spec, true)
+}
+
+/// 删除本地模型缓存，回到词法重排。
+pub fn remove(model: Option<&str>) -> Result<PathBuf, String> {
+    let spec = spec_for(model)?;
+    let dir = repo_cache_dir(&cache_dir(), spec.repo);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("删除模型目录失败: {e}"))?;
+    }
+    Ok(dir)
+}
+
+/// 已下载模型占用的字节数（未安装返回 0）
+fn installed_size() -> u64 {
+    let Ok(spec) = model_spec() else {
+        return 0;
+    };
+    let dir = repo_cache_dir(&cache_dir(), spec.repo);
+    let Ok(rev) = std::fs::read_to_string(dir.join("refs").join("main")) else {
+        return 0;
+    };
+    let snapshot = dir.join("snapshots").join(rev.trim());
+    model_files(&spec)
+        .iter()
+        .filter_map(|f| snapshot.join(f).metadata().ok().map(|m| m.len()))
+        .sum()
+}
+
 fn http_client() -> Result<reqwest::blocking::Client, String> {
     use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
@@ -175,41 +286,41 @@ fn http_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("创建下载客户端失败: {e}"))
 }
 
-/// 用普通 GET（不带 Range）补齐 hf-hub 的缓存目录。
-/// 国内镜像（hf-mirror）不支持 Range，hf-hub 会因缺少 Content-Range 报错，
-/// 因此这里先自行下载，之后 fastembed 直接读本地缓存即可。
-fn ensure_cache(spec: &ModelSpec) -> Result<PathBuf, String> {
+/// 检查/补齐本地缓存目录。
+/// `allow_download = false` 时只接受完整可用的本地模型，缺失直接报错（绝不联网）；
+/// 只有显式的 `models download` 命令才允许传入 true。
+/// 下载用普通 GET（不带 Range），兼容不支持 Range 的国内镜像（hf-mirror）。
+fn ensure_cache(spec: &ModelSpec, allow_download: bool) -> Result<PathBuf, String> {
     let root = cache_dir();
     let repo_dir = repo_cache_dir(&root, spec.repo);
     let ref_file = repo_dir.join("refs").join("main");
     let files = model_files(spec);
-
-    let ready = |revision: &str| {
-        files.iter().all(|file| {
-            repo_dir
-                .join("snapshots")
-                .join(revision)
-                .join(file)
-                .metadata()
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
-        })
-    };
 
     let mut revision = std::fs::read_to_string(&ref_file)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     if let Some(rev) = &revision {
-        if ready(rev) {
+        if files_ready(&repo_dir, rev, spec) {
             return Ok(root);
         }
+    }
+
+    if !allow_download {
+        return Err(format!(
+            "本地未找到可用的 embedding 模型（{}）。运行 `aggrsearch models download` 安装，或继续使用词法重排",
+            repo_dir.display()
+        ));
     }
 
     let client = http_client()?;
     let endpoint = hf_endpoint();
 
-    if revision.is_none() || !ready(revision.as_deref().unwrap_or_default()) {
+    if revision
+        .as_deref()
+        .map(|rev| !files_ready(&repo_dir, rev, spec))
+        .unwrap_or(true)
+    {
         let url = format!("{endpoint}/api/models/{}", spec.repo);
         let resolved = client
             .get(&url)
@@ -280,11 +391,15 @@ fn download_file(
 fn load() -> Result<&'static Loaded, String> {
     let result = LOADED.get_or_init(|| {
         let spec = model_spec()?;
-        let cache = ensure_cache(&spec)?;
+        // 正常推理路径只读本地缓存；下载只允许由 `models download` 显式触发
+        let cache = ensure_cache(&spec, false)?;
         let mut options = TextInitOptions::new(spec.model)
             .with_cache_dir(cache)
             .with_show_download_progress(true)
-            .with_max_length(spec.max_length);
+            .with_max_length(spec.max_length)
+            // macOS 默认会注册 CoreML，长驻进程里多轮推理内存会持续膨胀；
+            // 强制 CPU 推理，内存稳定，短文本检索性能足够
+            .with_auto_device(AutoDevicePolicy::PreferCPU);
         if let Some(threads) = intra_threads() {
             options = options.with_intra_threads(threads);
         }
@@ -299,10 +414,14 @@ fn load() -> Result<&'static Loaded, String> {
     result.as_ref().map_err(|e| e.clone())
 }
 
-/// 启动预热：把模型加载/下载放到服务开始前，失败只告警不退出
+/// 启动预热：本地已有模型才加载；不会联网下载，失败只告警不退出
 pub fn warmup() {
-    if !enabled() {
-        eprintln!("[embedding] 已通过 AGGRSEARCH_EMBED 关闭，使用词法重排");
+    if mode() == Mode::Off {
+        eprintln!("[embedding] 已通过 AGGRSEARCH_EMBED=off 关闭，使用词法重排");
+        return;
+    }
+    if mode() == Mode::Auto && !local_ready() {
+        eprintln!("[embedding] 未安装本地模型，使用词法重排（需要向量重排请运行 `aggrsearch models download`）");
         return;
     }
     let started = std::time::Instant::now();
@@ -390,11 +509,16 @@ pub fn status() -> serde_json::Value {
         .map(|s| s.name)
         .unwrap_or("unknown")
         .to_string();
-    let ready = matches!(LOADED.get(), Some(Ok(_)));
+    let loaded = matches!(LOADED.get(), Some(Ok(_)));
     serde_json::json!({
+        "mode": mode_name(),
         "enabled": enabled(),
         "model": model,
-        "ready": ready,
+        // installed：磁盘上模型完整；loaded：已载入内存并可用于推理
+        "installed": local_ready(),
+        "loaded": loaded,
+        "size_bytes": installed_size(),
+        "cache_dir": cache_dir().display().to_string(),
     })
 }
 

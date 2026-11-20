@@ -1157,7 +1157,12 @@ fn print_banner(port: u16) {
             .to_string();
         println!("  重排: embedding ({model})");
     } else {
-        println!("  重排: 词法（embedding 已通过 AGGRSEARCH_EMBED 关闭）");
+        let reason = match embedding::mode() {
+            embedding::Mode::Off => "已通过 AGGRSEARCH_EMBED=off 关闭",
+            embedding::Mode::On => "模型缺失",
+            embedding::Mode::Auto => "未安装本地模型",
+        };
+        println!("  重排: 词法（{reason}；运行 `aggrsearch models download` 启用向量重排）");
     }
     println!(
         "  GET /search?q=&max_results=&freshness=d|w|m|y&topic=general|news&include_domains=&exclude_domains="
@@ -1182,6 +1187,48 @@ async fn serve(port: u16) {
     }
 }
 
+// ---------------- 模型管理子命令 ----------------
+
+fn cmd_models(args: &[String]) -> i32 {
+    let action = args.first().map(|s| s.as_str()).unwrap_or("status");
+    let model = args
+        .iter()
+        .position(|a| a == "--model")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str());
+    match action {
+        "status" => {
+            print_pretty(&embedding::status());
+            0
+        }
+        "download" => match embedding::download(model) {
+            Ok(dir) => {
+                println!("模型已安装: {}", dir.display());
+                println!("提示：保持 AGGRSEARCH_EMBED=auto（默认）即可自动使用向量重排。");
+                0
+            }
+            Err(e) => {
+                eprintln!("下载失败: {e}");
+                1
+            }
+        },
+        "remove" => match embedding::remove(model) {
+            Ok(dir) => {
+                println!("已删除本地模型缓存: {}", dir.display());
+                println!("后续搜索将使用词法重排。");
+                0
+            }
+            Err(e) => {
+                eprintln!("删除失败: {e}");
+                1
+            }
+        },
+        other => bail(&format!(
+            "未知 models 子命令: {other}（可用: status / download / remove）"
+        )),
+    }
+}
+
 // ---------------- 命令行接口 ----------------
 
 const USAGE: &str = r#"aggrsearch —— 面向 AI 的多聚合搜索服务
@@ -1190,8 +1237,14 @@ const USAGE: &str = r#"aggrsearch —— 面向 AI 的多聚合搜索服务
   aggrsearch serve [--port <端口>]      启动本地 HTTP 服务（默认 127.0.0.1:8080）
   aggrsearch search <关键词...> [选项]  直接搜索并打印结果
   aggrsearch fetch <URL> [--json]       抓取网页正文
+  aggrsearch models status              查看向量重排模型状态（默认）
+  aggrsearch models download [--model <gemma|gemma-q4|minilm>]
+                                        显式下载并安装本地模型（唯一联网入口）
+  aggrsearch models remove [--model ...] 删除本地模型，回到词法重排
   aggrsearch health                     打印健康检查 JSON
   aggrsearch version                    打印版本号
+
+向量重排默认 auto：本地有完整模型才启用，没有就用词法重排，绝不自动下载。
 
 search 选项:
   --max <n>              返回条数（1-20，默认 10）
@@ -1451,6 +1504,7 @@ async fn main() {
         }
         Some("search") => cmd_search(&args[1..]).await,
         Some("fetch") => cmd_fetch(&args[1..]).await,
+        Some("models") => cmd_models(&args[1..]),
         Some("health") => {
             print_pretty(&health_payload());
             0
